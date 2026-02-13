@@ -21,6 +21,31 @@ def download_dataset(repo_id: str, root_dir: str | Path):
     print(f"Total episodes: {dataset.meta.total_episodes}")
     print(f"Total frames: {dataset.meta.total_frames}")
     print(f"Data stored in: {dataset.root}")
+    
+    print_dataset_keys(dataset)
+
+def print_dataset_keys(dataset: LeRobotDataset):
+    """
+    Prints the keys (features) of the dataset in a neat format.
+    """
+    print("\n" + "=" * 40)
+    print(f"Dataset Keys (Features) for '{dataset.repo_id}':")
+    print("=" * 40)
+    
+    # Get features from metadata
+    features = dataset.features
+    
+    # Sort keys for consistent output
+    sorted_keys = sorted(features.keys())
+    
+    for key in sorted_keys:
+        # Get shape/dtype info if available
+        feature_info = features[key]
+        dtype = feature_info.get("dtype", "unknown")
+        shape = feature_info.get("shape", "N/A")
+        print(f"  - {key:<30} [dtype: {dtype}, shape: {shape}]")
+    
+    print("=" * 40 + "\n")
 
 if __name__ == "__main__":
     # Configuration
