@@ -10,22 +10,11 @@ from transformers import pipeline
 
 log = logging.getLogger(__name__)
 
-
-def _get_device(requested: str) -> str:
-    """Return 'cuda' only if it actually works, else 'cpu'."""
-    if requested != "cuda" or not torch.cuda.is_available():
-        return "cpu"
-    try:
-        _ = torch.zeros(1, device="cuda") + 1
-        return "cuda"
-    except RuntimeError:
-        log.warning("CUDA requested but kernels not compatible, falling back to CPU")
-        return "cpu"
-
+def _get_device(requested: str) -> str: 
+    return "cuda" if requested == "cuda" and torch.cuda.is_available() else "cpu"
 
 class DepthEstimator:
     """Depth estimation using HuggingFace pipeline (DA_v2 or ZoeDepth)."""
-
     def __init__(self, model_id: str, colormap: str = "INFERNO", device: str = "cuda"):
         actual_device = _get_device(device)
         log.info("Depth model will run on: %s", actual_device)
@@ -35,17 +24,14 @@ class DepthEstimator:
     def estimate(self, rgb_frame: np.ndarray) -> np.ndarray:
         """
         Estimate depth and return colorized RGB visualization.
-
         Args:
             rgb_frame: RGB image (H, W, 3), uint8
-
         Returns:
             Depth map (H, W, 3), uint8, RGB colorized
         """
         pil_img = Image.fromarray(rgb_frame)
         outputs = self.pipe(pil_img)
-        depth_pil = outputs["depth"]
-        depth_np = np.array(depth_pil)
+        depth_np = np.array(outputs["depth"])
 
         # Normalize to 0-255
         depth_norm = cv2.normalize(depth_np, None, 0, 255, cv2.NORM_MINMAX)
