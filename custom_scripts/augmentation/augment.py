@@ -48,7 +48,7 @@ log = logging.getLogger(__name__)
 def load_config(config_path: str) -> dict:
     """Load and validate the YAML configuration."""
     with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) # reads yaml file using pyyaml library.
 
     # Exclusive depth model check
     da_v2 = cfg["modalities"]["depth_da_v2"]
@@ -75,18 +75,15 @@ def load_config(config_path: str) -> dict:
 
     return cfg
 
-
 def get_depth_suffix(cfg: dict) -> str:
     """Return the depth modality suffix based on config."""
     if cfg["modalities"]["depth_da_v2"]:
         return "depth_da_v2"
     return "depth_zoedepth"
 
-
 # ---------------------------------------------------------------------------
 # Feature construction
 # ---------------------------------------------------------------------------
-
 
 def build_augmented_features(src_features: dict, cameras: list[str], depth_suffix: str) -> dict:
     """
@@ -127,11 +124,9 @@ def build_augmented_features(src_features: dict, cameras: list[str], depth_suffi
 
     return features
 
-
 # ---------------------------------------------------------------------------
 # Video reading
 # ---------------------------------------------------------------------------
-
 
 def read_episode_frames(
     src: LeRobotDataset,
@@ -142,7 +137,6 @@ def read_episode_frames(
     """
     Read all frames for one episode from one camera using direct pyav.
     This avoids torchvision.io.VideoReader conflicts with cv2.
-
     Returns:
         frames: (T, H, W, 3) uint8 RGB numpy array
     """
@@ -204,13 +198,11 @@ def read_episode_frames(
             
     return frames_np
 
-
 # ---------------------------------------------------------------------------
 # Frame processing
 # ---------------------------------------------------------------------------
 
-
-def process_frames(
+def process_frames( # takes in frames and outputs modalities
     frames_rgb: np.ndarray,
     segmenter: YOLOSegmenter,
     canny: CannyDetector,
@@ -221,7 +213,6 @@ def process_frames(
 ) -> dict[str, list[np.ndarray]]:
     """
     Process all frames for one camera to generate 5 modalities.
-
     Returns:
         dict mapping modality suffix to list of (H, W, 3) uint8 frames
     """
@@ -271,11 +262,9 @@ def process_frames(
 
     return modalities
 
-
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
-
 
 def get_episode_task(src: LeRobotDataset, ep_idx: int) -> str:
     """Get the task string for an episode from the source dataset."""
@@ -291,7 +280,6 @@ def get_episode_task(src: LeRobotDataset, ep_idx: int) -> str:
                 task_idx = task_idx.item()
             return src.meta.tasks.iloc[task_idx].name
     raise ValueError(f"No frames found for episode {ep_idx}")
-
 
 def get_episode_data_slice(src: LeRobotDataset, ep_idx: int) -> tuple[int, int]:
     """Get the (from_index, to_index) for an episode in the hf_dataset."""
@@ -328,6 +316,7 @@ def run_pipeline(cfg: dict, episode_indices: list[int] | None = None):
     # ---------------------------------------------------------------
     # Step 2: Build augmented features dict
     # ---------------------------------------------------------------
+    # print(f"Source dataset features: \n{src.meta.features}") # all features available
     aug_features = build_augmented_features(src.meta.features, cameras, depth_suffix)
     log.info("Augmented features (%d total):", len(aug_features))
     for k, v in aug_features.items():
@@ -522,12 +511,9 @@ def run_pipeline(cfg: dict, episode_indices: list[int] | None = None):
         dst.root,
     )
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
-
 def main():
     parser = argparse.ArgumentParser(description="Augment LeRobot dataset with visual modalities")
     parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
@@ -542,7 +528,6 @@ def main():
 
     cfg = load_config(args.config)
     run_pipeline(cfg, args.episodes)
-
 
 if __name__ == "__main__":
     main()
