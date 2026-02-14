@@ -1,0 +1,61 @@
+# Dataset Augmentation Configuration
+# Adds 10 new video modalities to the source dataset
+
+dataset:
+  source_repo_id: "pranavnaik98/bimanual_so101_stacking_100"
+  source_path: "/home/kinisi/Documents/main/lerobot-bimanual/custom_scripts/analysis/data/pranavnaik98/bimanual_so101_stacking_100"
+  output_repo_id: "pranavnaik98/bimanual_so101_stacking_100_augmented"
+  output_path: "/home/kinisi/Documents/main/lerobot-bimanual/custom_scripts/analysis/data/pranavnaik98/bimanual_so101_stacking_100_augmented"
+
+# Camera observations to augment
+cameras:
+  - observation.images.top
+  - observation.images.front
+
+# Modalities to generate (5 per camera = 10 total)
+modalities:
+  seg: true
+  edges: true
+  depth_da_v2: true           # EXCLUSIVE with zoedepth
+  depth_zoedepth: false       # EXCLUSIVE with da_v2
+  mask_edge_overlay: true
+  original_mask_edge_overlay: true
+
+# YOLO segmentation (per camera)
+segmentation:
+  top_camera:
+    model_path: "/home/kinisi/Documents/side/AutoAnnotatorPy/model_training/annotations/top_camera/output/seg_20251231_124816/weights/best.pt"
+    conf: 0.25
+    iou: 0.45
+    imgsz: 512
+    retina_masks: false
+    max_det: 8
+  front_camera:
+    model_path: "/home/kinisi/Documents/side/AutoAnnotatorPy/model_training/annotations/real/output/seg_20251231_135408/weights/best.pt"
+    conf: 0.25
+    iou: 0.45
+    imgsz: 512
+    retina_masks: false
+    max_det: 8
+
+# Depth models (exclusive - only one at a time)
+depth:
+  da_v2:
+    model_id: "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
+    colormap: "INFERNO"
+  zoedepth:
+    model_id: "Intel/zoedepth-nyu"
+    colormap: "MAGMA"
+
+# Canny edge detection
+canny:
+  threshold1: 100
+  threshold2: 200
+  aperture_size: 3
+
+# Processing parameters
+processing:
+  device: "cuda"
+  image_writer_threads: 4
+  tolerance_s: 0.04
+  cuda_clear_interval: 50
