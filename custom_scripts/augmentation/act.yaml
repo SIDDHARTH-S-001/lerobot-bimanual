@@ -1,0 +1,76 @@
+# ACT Policy Configuration for Augmented Dataset
+
+# Training Pipeline Configuration
+# Usage: lerobot-train --config custom_scripts/augmentation/act.yaml
+
+dataset:
+  repo_id: SiddharthS2K01/bimanual_so101_stacking_100_fully_augmented
+  root: /home/kinisi/Documents/main/lerobot-bimanual/custom_scripts/analysis/data/bimanual_so101_stacking_100_fully_augmented
+  # CRITICAL: Use pyav backend to correctly read the videos (bypassing torchcodec/libtorchcodec issues)
+  video_backend: pyav
+
+policy:
+  type: act
+  
+  # Model Architecture
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+  vision_backbone: resnet18
+  dim_model: 512
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  dropout: 0.1
+  
+  # VAE Settings
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  # Inference
+  temporal_ensemble_coeff: null
+
+  # Training
+  repo_id: SiddharthS2K01/act_bimanual_augmented
+  
+  # Feature selection (Optional: LeRobot usually infers this)
+  # To use augmented features (e.g. segmentation), you may need to map them here or in overrides
+  # For now, we use the standard RGB inputs + state
+  input_features:
+    observation.images.top:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.images.front:
+      type: VISUAL
+      shape: [3, 480, 640]
+    observation.state:
+      type: STATE
+      shape: [12]
+  
+  output_features:
+    action:
+      type: ACTION
+      shape: [12]
+
+# Training Parameters
+batch_size: 8
+steps: 100000
+eval_freq: 20000
+save_freq: 20000
+save_checkpoint: true
+num_workers: 4
+seed: 1000
+
+# Optimization
+optimizer:
+  type: adamw
+  lr: 1e-5
+  weight_decay: 1e-4
+  grad_clip_norm: 10.0
+
+# Logging
+wandb:
+  enable: false
+output_dir: /home/kinisi/Documents/main/lerobot-bimanual/custom_scripts/analysis/training_output
