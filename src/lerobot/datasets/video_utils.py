@@ -29,6 +29,8 @@ import fsspec
 import pyarrow as pa
 import torch
 import torchvision
+torchvision.set_video_backend("pyav")
+
 from datasets.features.features import register_feature
 from PIL import Image
 
@@ -67,10 +69,96 @@ def decode_video_frames(
         backend = get_safe_default_codec()
     if backend == "torchcodec":
         return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
-    elif backend in ["pyav", "video_reader"]:
+    elif backend == "pyav":
+        return decode_video_frames_pyav(video_path, timestamps, tolerance_s)
+    elif backend == "video_reader":
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
         raise ValueError(f"Unsupported video backend: {backend}")
+
+
+def decode_video_frames_pyav(
+    video_path: Path | str,
+    timestamps: list[float],
+    tolerance_s: float,
+) -> torch.Tensor:
+    """
+    Decodes frames using PyAV directly.
+    Bypasses torchvision.io.VideoReader which has conflicts with cv2 in some environments.
+    """
+    container = av.open(str(video_path))
+    stream = container.streams.video[0]
+    stream.thread_type = "AUTO"
+    
+    # We need to retrieve frames for each timestamp. 
+    # Since timestamps usually come in chunks, we optimize for sequential access 
+    # by sorting unique timestamps, but we map them back to original order.
+    unique_ts = sorted(list(set(timestamps)))
+    ts_to_frame = {}
+    
+    # Optimization: If timestamps are sequential and close, we iterate.
+    # If they are far apart, we seek.
+    # For simplicity and robustness (since this is likely a chunk), we seek to first 
+    # and try to read sequentially, seeking only if we drift too far or need to go back.
+    
+    # Current generic approach: Seek for every timestamp that isn't the next one.
+    # But seeking is slow. 
+    
+    # Let's iterate through sorted unique timestamps
+    last_processed_ts = -1.0
+    
+    for target_ts in unique_ts:
+        # If this target is behind where we are (shouldn't happen with sorted) 
+        # or far ahead, or we are just starting -> Seek.
+        # "Far ahead" is a bit subjective, but let's say > 1 second gap? 
+        # Actually simplest robust way: Seek to target keyframe 
+        # (pts = target / time_base) and decode until we hit it.
+        
+        pts = int(target_ts / stream.time_base)
+        container.seek(pts, stream=stream)
+        
+        # Decode frames until we find the target
+        # Note: seek lands on a keyframe <= target_pts usually.
+        for frame in container.decode(stream):
+            frame_ts = frame.time
+            
+            # If we passed the target + tolerance, we missed it (or seek was weird)
+            if frame_ts > target_ts + tolerance_s:
+                break
+            
+            # If within tolerance, save it
+            if abs(frame_ts - target_ts) <= tolerance_s:
+                # Found it!
+                img = frame.to_ndarray(format="rgb24")
+                # Convert to (C, H, W) float [0, 1]
+                tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+                ts_to_frame[target_ts] = tensor
+                break
+                
+    container.close()
+    
+    # Reassemble in requested order
+    output_frames = []
+    for ts in timestamps:
+        if ts in ts_to_frame:
+            output_frames.append(ts_to_frame[ts])
+        else:
+            # If a frame failed to load, we try to use the closest one or raise.
+            # LeRobot usually expects all frames.
+            # Let's verify if we missed any
+            keys = list(ts_to_frame.keys())
+            if not keys:
+                raise ValueError(f"Failed to decode any frames from {video_path}")
+                
+            # Find closest
+            closest_ts = min(keys, key=lambda k: abs(k - ts))
+            if abs(closest_ts - ts) <= tolerance_s:
+                output_frames.append(ts_to_frame[closest_ts])
+            else:
+                 # Raise error if strictly required, similar to original implementation check
+                 raise ValueError(f"Could not load frame at {ts} (closest {closest_ts}) from {video_path}")
+
+    return torch.stack(output_frames)
 
 
 def decode_video_frames_torchvision(
