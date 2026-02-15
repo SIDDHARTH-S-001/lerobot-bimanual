@@ -2,11 +2,11 @@
 Dataset Augmentation Pipeline - Main Entry Point
 
 Augments a LeRobot dataset with visual modalities (segmentation, edges, depth,
-overlays) using LeRobotDataset.create() + add_frame() + save_episode() API.
+overlays) using a flexible, class-based architecture.
 
 Usage:
     python augment.py --config config.yaml
-    python augment.py --config config.yaml --episodes 0 1 2  # test subset
+    python augment.py --config config.yaml --episodes 0 1 2 --dry-run
 """
 
 import argparse
@@ -14,7 +14,9 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
+import av # pyav
 import cv2
 import numpy as np
 import torch
@@ -24,7 +26,6 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[2] # original lerobot_bimanual repo dir path
 sys.path.insert(0, str(PROJECT_ROOT / "src")) # ~/lerobot_bimanual/src
 
-import av # pyav
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from models.depth import DepthEstimator
@@ -40,494 +41,469 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+class AugmentationPipeline:
+    def __init__(self, config_path: str):
+        """Initialize pipeline from config file."""
+        self.config_path = config_path
+        with open(config_path) as f:
+            self.cfg = yaml.safe_load(f)
 
+        self._validate_config()
 
-def load_config(config_path: str) -> dict:
-    """Load and validate the YAML configuration."""
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f) # reads yaml file using pyyaml library.
+        # Config extraction
+        self.dataset_cfg = self.cfg["dataset"]
+        self.modalities_cfg = self.cfg["modalities"]
+        self.proc_cfg = self.cfg["processing"]
+        self.cameras = self.cfg["cameras"]  # Dynamic list from config
 
-    # Exclusive depth model check
-    da_v2 = cfg["modalities"]["depth_da_v2"]
-    zoedepth = cfg["modalities"]["depth_zoedepth"]
-    if da_v2 and zoedepth:
-        raise ValueError(
-            "FATAL: Both depth models enabled. "
-            "Only ONE depth model can be active at a time. "
-            "Set either depth_da_v2 or depth_zoedepth to false."
-        )
-    if not da_v2 and not zoedepth:
-        raise ValueError("No depth model enabled. At least one must be active.")
-
-    # Validate YOLO model paths
-    for cam_key in ["top_camera", "front_camera"]:
-        model_path = Path(cfg["segmentation"][cam_key]["model_path"])
-        if not model_path.exists():
-            raise FileNotFoundError(f"YOLO model not found: {model_path}")
-
-    # Validate source dataset path
-    src_path = Path(cfg["dataset"]["source_path"])
-    if not src_path.exists():
-        raise FileNotFoundError(f"Source dataset not found: {src_path}")
-
-    return cfg
-
-def get_depth_suffix(cfg: dict) -> str:
-    """Return the depth modality suffix based on config."""
-    if cfg["modalities"]["depth_da_v2"]:
-        return "depth_da_v2"
-    return "depth_zoedepth"
-
-# ---------------------------------------------------------------------------
-# Feature construction
-# ---------------------------------------------------------------------------
-
-def build_augmented_features(src_features: dict, cameras: list[str], depth_suffix: str) -> dict:
-    """
-    Build the features dict for the augmented dataset.
-
-    Includes all source features (excluding DEFAULT_FEATURES which are auto-added)
-    plus 10 new video features (5 per camera).
-    """
-    # DEFAULT_FEATURES that LeRobotDatasetMetadata.create() adds automatically
-    default_keys = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
-
-    features = {}
-    for key, ft in src_features.items():
-        if key in default_keys:
-            continue
-        features[key] = ft.copy()
-        # Strip video info metadata from original video features
-        # (it will be regenerated during encoding with the correct codec info)
-        if ft["dtype"] == "video" and "info" in features[key]:
-            del features[key]["info"]
-
-    # Add new video features
-    modality_suffixes = [
-        "_seg",
-        "_edges",
-        f"_{depth_suffix}",
-        "_mask_edge_overlay",
-        "_original_mask_edge_overlay",
-    ]
-    for camera in cameras:
-        for suffix in modality_suffixes:
-            new_key = f"{camera}{suffix}"
-            features[new_key] = {
-                "dtype": "video",
-                "shape": [480, 640, 3],
-                "names": ["height", "width", "channels"],
-            }
-
-    return features
-
-# ---------------------------------------------------------------------------
-# Video reading
-# ---------------------------------------------------------------------------
-
-def read_episode_frames(
-    src: LeRobotDataset,
-    ep_idx: int,
-    camera: str,
-    tolerance_s: float,
-) -> np.ndarray:
-    """
-    Read all frames for one episode from one camera using direct pyav.
-    This avoids torchvision.io.VideoReader conflicts with cv2.
-    Returns:
-        frames: (T, H, W, 3) uint8 RGB numpy array
-    """
-    ep = src.meta.episodes[ep_idx]
-    episode_length = ep["length"]
-    from_ts = ep[f"videos/{camera}/from_timestamp"]
-    
-    video_path = src.root / src.meta.get_video_file_path(ep_idx, camera)
-    
-    container = av.open(str(video_path))
-    stream = container.streams.video[0]
-    stream.thread_type = "AUTO"
-    
-    # Seek to start timestamp
-    # Convert seconds to stream time base
-    target_pts = int(from_ts / stream.time_base)
-    container.seek(target_pts, stream=stream)
-    
-    frames = []
-    decoded_count = 0
-    
-    # Iterate and collect frames
-    # Note: seek might land before the target, so we need to discard until we reach it
-    # But since we just want sequential frames for the episode, catching the first one close enough is key.
-    # Given the tolerance logic in LeRobot, we rely on the stream PTS.
-    
-    # Simple logic: decode until we have enough frames. 
-    # Since episodes are sequential, we might need to skip frames if seek landed too early.
-    
-    # Actually, let's implement strict timestamp checking similar to decode_video_frames but sequential
-    # But `from_ts` is the EXACT timestamp of the first frame of the episode in this file.
-    
-    for frame in container.decode(stream):
-        # Skip if before start time (with slight tolerance)
-        if frame.time < (from_ts - tolerance_s):
-            continue
-            
-        # Convert to RGB numpy
-        img = frame.to_ndarray(format="rgb24")
-        frames.append(img)
+        # Determine output name
+        self.output_repo_id, self.output_path = self._determine_output_name()
         
-        if len(frames) >= episode_length:
-            break
+        # Determine device
+        self.device = self.proc_cfg.get("device", "cuda")
+        self.use_gpu = self.device == "cuda" and torch.cuda.is_available() # Models handle internal checks
+        
+        self.models_loaded = False
+        self.segmenters = {}
+        self.canny_detectors = {}
+        self.depth_model = None
+
+    def _validate_config(self):
+        """Basic validation of paths and requirements."""
+        src_path = Path(self.cfg["dataset"]["source_path"])
+        if not src_path.exists():
+            raise FileNotFoundError(f"Source dataset not found: {src_path}")
+
+        # Check model paths
+        for cam_key in ["top_camera", "front_camera"]:
+            if cam_key in self.cfg["segmentation"]:
+                model_path = Path(self.cfg["segmentation"][cam_key]["model_path"])
+                if not model_path.exists():
+                    raise FileNotFoundError(f"YOLO model not found: {model_path}")
+
+    def _determine_output_name(self) -> tuple[str, Path]:
+        """
+        Dynamically construct output dataset name based on enabled modalities.
+        Logic: {original_name}_{separate_mods}_{overlay_mods}
+        """
+        original_name = self.dataset_cfg["original_name"]
+        root_dir = Path(self.dataset_cfg["root_dir"])
+
+        m_seg = self.modalities_cfg.get("seg", False)
+        m_edges = self.modalities_cfg.get("edges", False)
+        m_depth = self.modalities_cfg.get("depth", False)
+        m_overlays = self.modalities_cfg.get("overlays", False)
+
+        # 1. Fully augmented check
+        if m_seg and m_edges and m_depth and m_overlays:
+            suffix = "fully_augmented"
+        else:
+            # 2. Separate modalities string (m, d, e)
+            sep_str = ""
+            if m_seg:
+                sep_str += "m"
+            if m_depth:
+                sep_str += "d"
+            if m_edges:
+                sep_str += "e"
             
-    container.close()
-    
-    frames_np = np.stack(frames)
-    
-    # Validation
-    if len(frames_np) != episode_length:
-        log.warning(
-            "Expected %d frames, got %d for ep_idx=%d camera=%s", 
-            episode_length, len(frames_np), ep_idx, camera
-        )
-        # Pad or trim if strictly necessary? 
-        # For now, let's raise if mismatch is large, but usually it matches.
-        if len(frames_np) < episode_length:
-            raise RuntimeError(f"Could not read enough frames from {video_path}")
+            # 3. Overlay modalities string
+            overlay_str = ""
+            if m_overlays:
+                overlay_str = "me_overlay"
             
-    return frames_np
+            # Combine parts
+            parts = []
+            if sep_str:
+                parts.append(sep_str)
+            if overlay_str:
+                parts.append(overlay_str)
+            
+            suffix = "_".join(parts)
 
-# ---------------------------------------------------------------------------
-# Frame processing
-# ---------------------------------------------------------------------------
+        # Final construction
+        if suffix:
+            repo_name = f"{original_name}_{suffix}"
+        else:
+            repo_name = f"{original_name}_copy" # Fallback if nothing enabled
 
-def process_frames( # takes in frames and outputs modalities
-    frames_rgb: np.ndarray,
-    segmenter: YOLOSegmenter,
-    canny: CannyDetector,
-    depth_model: DepthEstimator,
-    depth_suffix: str,
-    device: str,
-    cuda_clear_interval: int,
-) -> dict[str, list[np.ndarray]]:
-    """
-    Process all frames for one camera to generate 5 modalities.
-    Returns:
-        dict mapping modality suffix to list of (H, W, 3) uint8 frames
-    """
-    modalities = {
-        "seg": [],
-        "edges": [],
-        depth_suffix: [],
-        "mask_edge_overlay": [],
-        "original_mask_edge_overlay": [],
-    }
+        output_path = root_dir / repo_name
+        
+        # Construct repo ID (assuming user/repo format from original)
+        # We'll use the original source repo ID's user prefix if available
+        src_repo_id = self.dataset_cfg["source_repo_id"]
+        if "/" in src_repo_id:
+            user_prefix = src_repo_id.split("/")[0]
+            repo_id = f"{user_prefix}/{repo_name}"
+        else:
+            repo_id = repo_name
 
-    use_gpu = device == "cuda" and torch.cuda.is_available()
-    num_frames = len(frames_rgb)
+        log.info(f"Dynamic Output Name: {repo_name}")
+        log.info(f"Target Repo ID: {repo_id}")
+        log.info(f"Target Path: {output_path}")
 
-    for idx in range(num_frames):
-        frame = frames_rgb[idx]
+        return repo_id, output_path
 
-        # Generate base modalities
-        mask = segmenter.segment(frame)
-        edges = canny.detect(frame)
-        depth = depth_model.estimate(frame)
+    def _init_models(self):
+        """Initialize all required models."""
+        log.info("Initializing models...")
 
-        # Verify sizes match original
-        assert mask.shape == frame.shape, f"Mask size mismatch at frame {idx}"
-        assert edges.shape == frame.shape, f"Edges size mismatch at frame {idx}"
-        assert depth.shape == frame.shape, f"Depth size mismatch at frame {idx}"
+        # YOLO Segmenters (per camera)
+        if self.modalities_cfg.get("seg", False) or self.modalities_cfg.get("overlays", False):
+            for cam in self.cameras:
+                # Map observation key (e.g. observation.images.top) to config key (top_camera)
+                # Simple logic: check if 'top' or 'front' in name
+                if "top" in cam:
+                    cfg_key = "top_camera"
+                elif "front" in cam:
+                    cfg_key = "front_camera"
+                else:
+                    log.warning(f"Unknown camera {cam}, skipping segmentation init")
+                    continue
+                
+                seg_cfg = self.cfg["segmentation"][cfg_key]
+                self.segmenters[cam] = YOLOSegmenter(
+                    model_path=seg_cfg["model_path"],
+                    conf=seg_cfg["conf"],
+                    iou=seg_cfg["iou"],
+                    imgsz=seg_cfg["imgsz"],
+                    retina_masks=seg_cfg["retina_masks"],
+                    max_det=seg_cfg["max_det"],
+                    device=self.device,
+                )
+                log.info(f"  YOLO loaded for {cam}")
 
-        # Compute overlays
-        me_overlay = mask_edge_overlay(mask, edges)
-        ome_overlay = original_mask_edge_overlay(frame, mask, edges)
+        # Depth Model
+        if self.modalities_cfg.get("depth", False):
+            d_cfg = self.cfg["depth"]
+            if d_cfg["type"] == "da_v2":
+                model_cfg = d_cfg["da_v2"]
+                self.depth_suffix = "depth_da_v2"
+            else:
+                model_cfg = d_cfg["zoedepth"]
+                self.depth_suffix = "depth_zoedepth"
+            
+            self.depth_model = DepthEstimator(
+                model_id=model_cfg["model_id"],
+                colormap=model_cfg["colormap"],
+                device=self.device,
+            )
+            log.info(f"  Depth model loaded: {model_cfg['model_id']}")
+        else:
+            self.depth_suffix = "depth" # Placeholder
 
-        # Store
-        modalities["seg"].append(mask)
-        modalities["edges"].append(edges)
-        modalities[depth_suffix].append(depth)
-        modalities["mask_edge_overlay"].append(me_overlay)
-        modalities["original_mask_edge_overlay"].append(ome_overlay)
+        # Canny Detectors (per camera)
+        if self.modalities_cfg.get("edges", False) or self.modalities_cfg.get("overlays", False):
+            for cam in self.cameras:
+                if "top" in cam:
+                    cfg_key = "top_camera"
+                elif "front" in cam:
+                    cfg_key = "front_camera"
+                else:
+                    continue # Should not happen based on config
 
-        # Clear CUDA cache periodically
-        if use_gpu and idx > 0 and idx % cuda_clear_interval == 0:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+                canny_cfg = self.cfg["canny"][cfg_key]
+                self.canny_detectors[cam] = CannyDetector(
+                    threshold1=canny_cfg["threshold1"],
+                    threshold2=canny_cfg["threshold2"],
+                    aperture_size=canny_cfg["aperture_size"]
+                )
+                log.info(f"  Canny initialized for {cam}: {canny_cfg}")
+        
+        self.models_loaded = True
 
-        # Progress log every 100 frames
-        if (idx + 1) % 100 == 0 or (idx + 1) == num_frames:
-            log.info("    Frame %d/%d", idx + 1, num_frames)
+    def _build_features(self, src_features: dict) -> dict:
+        """Construct the features dictionary for the new dataset."""
+        default_keys = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
+        features = {}
+        
+        # Copy non-default features
+        for key, ft in src_features.items():
+            if key in default_keys:
+                continue
+            features[key] = ft.copy()
+            if ft["dtype"] == "video" and "info" in features[key]:
+                del features[key]["info"]
 
-    return modalities
+        # Add new modalities
+        suffixes = []
+        if self.modalities_cfg.get("seg", False):
+            suffixes.append("_seg")
+        if self.modalities_cfg.get("edges", False):
+            suffixes.append("_edges")
+        if self.modalities_cfg.get("depth", False):
+            suffixes.append(f"_{self.depth_suffix}")
+        if self.modalities_cfg.get("overlays", False):
+            suffixes.append("_mask_edge_overlay")
+            suffixes.append("_original_mask_edge_overlay")
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
+        for cam in self.cameras:
+            for s in suffixes:
+                new_key = f"{cam}{s}"
+                features[new_key] = {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                    "names": ["height", "width", "channels"],
+                }
+        
+        return features
 
-def get_episode_task(src: LeRobotDataset, ep_idx: int) -> str:
-    """Get the task string for an episode from the source dataset."""
-    # Find the first frame of this episode in the hf_dataset
-    for i in range(len(src.hf_dataset)):
-        item = src.hf_dataset[i]
-        ep = item["episode_index"]
-        if hasattr(ep, "item"):
-            ep = ep.item()
-        if ep == ep_idx:
-            task_idx = item["task_index"]
-            if hasattr(task_idx, "item"):
-                task_idx = task_idx.item()
-            return src.meta.tasks.iloc[task_idx].name
-    raise ValueError(f"No frames found for episode {ep_idx}")
+    def get_episode_info(self, src: LeRobotDataset, ep_idx: int) -> tuple[str, int, int]:
+        """
+        Combined helper to get task string and data indices for an episode.
+        Returns: (task_string, from_index, to_index)
+        """
+        # Get task string
+        # We need to find the task index from the dataset item
+        # Since map is heavy, we'll access the first frame of the episode via indices logic
+        ep = src.meta.episodes[ep_idx]
+        from_idx = ep["dataset_from_index"]
+        to_idx = ep["dataset_to_index"]
+        
+        # Read the item to get task_index
+        # Note: src.hf_dataset access might be slow if random access, but here we do it once per ep
+        item = src.hf_dataset[from_idx]
+        task_idx = item["task_index"]
+        if hasattr(task_idx, "item"):
+            task_idx = task_idx.item()
+        
+        task_str = src.meta.tasks.iloc[task_idx].name
+        
+        return task_str, from_idx, to_idx
 
-def get_episode_data_slice(src: LeRobotDataset, ep_idx: int) -> tuple[int, int]:
-    """Get the (from_index, to_index) for an episode in the hf_dataset."""
-    ep = src.meta.episodes[ep_idx]
-    from_idx = ep["dataset_from_index"]
-    to_idx = ep["dataset_to_index"]
-    return from_idx, to_idx
-
-
-def run_pipeline(cfg: dict, episode_indices: list[int] | None = None):
-    """Run the full augmentation pipeline."""
-    depth_suffix = get_depth_suffix(cfg)
-    cameras = cfg["cameras"]
-    device = cfg["processing"]["device"]
-    tolerance_s = cfg["processing"]["tolerance_s"]
-    cuda_clear_interval = cfg["processing"]["cuda_clear_interval"]
-
-    # ---------------------------------------------------------------
-    # Step 1: Load source dataset
-    # ---------------------------------------------------------------
-    log.info("Loading source dataset: %s", cfg["dataset"]["source_repo_id"])
-    src = LeRobotDataset(
-        repo_id=cfg["dataset"]["source_repo_id"],
-        root=cfg["dataset"]["source_path"],
-        video_backend="pyav",
-    )
-    log.info(
-        "Source: %d episodes, %d frames, features: %s",
-        src.meta.total_episodes,
-        src.meta.total_frames,
-        list(src.meta.features.keys()),
-    )
-
-    # ---------------------------------------------------------------
-    # Step 2: Build augmented features dict
-    # ---------------------------------------------------------------
-    # print(f"Source dataset features: \n{src.meta.features}") # all features available
-    aug_features = build_augmented_features(src.meta.features, cameras, depth_suffix)
-    log.info("Augmented features (%d total):", len(aug_features))
-    for k, v in aug_features.items():
-        log.info("  %s: dtype=%s, shape=%s", k, v["dtype"], v.get("shape"))
-
-    # ---------------------------------------------------------------
-    # Step 3: Create destination dataset
-    # ---------------------------------------------------------------
-    output_path = Path(cfg["dataset"]["output_path"])
-    if output_path.exists():
-        import shutil
-        log.info("Removing existing output directory: %s", output_path)
-        shutil.rmtree(output_path)
-
-    log.info("Creating augmented dataset: %s", cfg["dataset"]["output_repo_id"])
-    dst = LeRobotDataset.create(
-        repo_id=cfg["dataset"]["output_repo_id"],
-        fps=src.fps,
-        features=aug_features,
-        root=str(output_path),
-        robot_type=src.meta.robot_type,
-        use_videos=True,
-        image_writer_processes=0,
-        image_writer_threads=cfg["processing"]["image_writer_threads"],
-    )
-    log.info("Destination dataset created at: %s", dst.root)
-
-    # ---------------------------------------------------------------
-    # Step 4: Initialize models
-    # ---------------------------------------------------------------
-    log.info("Initializing models...")
-
-    # Camera -> YOLO segmenter mapping
-    segmenters = {}
-    for camera in cameras:
-        cam_key = "top_camera" if "top" in camera else "front_camera"
-        seg_cfg = cfg["segmentation"][cam_key]
-        segmenters[camera] = YOLOSegmenter(
-            model_path=seg_cfg["model_path"],
-            conf=seg_cfg["conf"],
-            iou=seg_cfg["iou"],
-            imgsz=seg_cfg["imgsz"],
-            retina_masks=seg_cfg["retina_masks"],
-            max_det=seg_cfg["max_det"],
-            device=device,
-        )
-        log.info("  YOLO segmenter for %s loaded", camera)
-
-    # Depth model (exclusive)
-    if cfg["modalities"]["depth_da_v2"]:
-        depth_cfg = cfg["depth"]["da_v2"]
-    else:
-        depth_cfg = cfg["depth"]["zoedepth"]
-    depth_model = DepthEstimator(
-        model_id=depth_cfg["model_id"],
-        colormap=depth_cfg["colormap"],
-        device=device,
-    )
-    log.info("  Depth model loaded: %s", depth_cfg["model_id"])
-
-    # Canny
-    canny = CannyDetector(**cfg["canny"])
-    log.info("  Canny detector initialized")
-
-    # ---------------------------------------------------------------
-    # Step 5: Determine episodes to process
-    # ---------------------------------------------------------------
-    if episode_indices is not None:
-        episodes = episode_indices
-    else:
-        episodes = list(range(src.meta.total_episodes))
-
-    total_episodes = len(episodes)
-    log.info("Processing %d episodes: %s", total_episodes, episodes[:10])
-
-    # ---------------------------------------------------------------
-    # Step 6: Process each episode
-    # ---------------------------------------------------------------
-    pipeline_start = time.time()
-    total_frames_processed = 0
-
-    for ep_num, ep_idx in enumerate(episodes):
-        ep_start = time.time()
+    def read_frames_pyav(self, src: LeRobotDataset, ep_idx: int, camera: str) -> np.ndarray:
+        """Read frames using PyAV directly (bypassing torchvision Conflict)."""
         ep = src.meta.episodes[ep_idx]
         episode_length = ep["length"]
+        from_ts = ep[f"videos/{camera}/from_timestamp"]
+        tolerance_s = self.proc_cfg.get("tolerance_s", 0.04)
 
-        log.info(
-            "=== Episode %d/%d (index=%d, length=%d) ===",
-            ep_num + 1, total_episodes, ep_idx, episode_length,
+        video_path = src.root / src.meta.get_video_file_path(ep_idx, camera)
+        
+        container = av.open(str(video_path))
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        
+        target_pts = int(from_ts / stream.time_base)
+        container.seek(target_pts, stream=stream)
+        
+        frames = []
+        for frame in container.decode(stream):
+            if frame.time < (from_ts - tolerance_s):
+                continue
+            
+            img = frame.to_ndarray(format="rgb24")
+            frames.append(img)
+            
+            if len(frames) >= episode_length:
+                break
+        
+        container.close()
+        
+        if len(frames) < episode_length:
+            log.warning(f"Frame mismatch for ep {ep_idx} {camera}: got {len(frames)}, expected {episode_length}")
+            # Pad with last frame if needed? Or raise?
+            # User's strict requirement suggests we should care, but validation might fail if we don't return enough.
+            # We'll fail fast for now.
+            raise RuntimeError(f"Read {len(frames)}/{episode_length} frames for {video_path}")
+            
+        return np.stack(frames) # (T, H, W, 3)
+
+    def process_camera_frames(self, frames_rgb: np.ndarray, camera: str) -> dict[str, list[np.ndarray]]:
+        """Process all frames for a single camera view."""
+        # Outputs storage
+        outs = {}
+        # Init lists for enabled modalities
+        keys = []
+        if self.modalities_cfg.get("seg", False):
+            keys.append("seg")
+        if self.modalities_cfg.get("edges", False):
+            keys.append("edges")
+        if self.modalities_cfg.get("depth", False):
+            keys.append(self.depth_suffix)
+        if self.modalities_cfg.get("overlays", False):
+            keys.append("mask_edge_overlay")
+            keys.append("original_mask_edge_overlay")
+            
+        if not keys:
+            return {} # Nothing to do
+
+        for k in keys:
+            outs[k] = []
+
+        # Models
+        segmenter = self.segmenters.get(camera)
+        canny = self.canny_detectors.get(camera)
+        
+        num_frames = len(frames_rgb)
+        
+        for i in range(num_frames):
+            frame = frames_rgb[i]
+            
+            # 1. Segmentation
+            mask = None
+            if segmenter:
+                mask = segmenter.segment(frame)
+                if self.modalities_cfg.get("seg", False):
+                    outs["seg"].append(mask)
+
+            # 2. Edges
+            edges = None
+            if canny:
+                edges = canny.detect(frame)
+                if self.modalities_cfg.get("edges", False):
+                    outs["edges"].append(edges)
+            
+            # 3. Depth
+            if self.modalities_cfg.get("depth", False):
+                depth = self.depth_model.estimate(frame)
+                outs[self.depth_suffix].append(depth)
+
+            # 4. Overlays
+            if self.modalities_cfg.get("overlays", False):
+                # Ensure mask/edges exist (they should if logic is correct)
+                # If separate seg/edges disabled but overlays enabled, we ran models above but didn't save separate output.
+                # So mask/edges variables hold the data needed here.
+                if mask is None: # Should have run segmenter
+                   if not segmenter: raise RuntimeError("Overlays enabled but no segmenter found")
+                   mask = segmenter.segment(frame)
+                if edges is None:
+                    if not canny: raise RuntimeError("Overlays enabled but no canny found")
+                    edges = canny.detect(frame)
+                
+                outs["mask_edge_overlay"].append(mask_edge_overlay(mask, edges))
+                outs["original_mask_edge_overlay"].append(original_mask_edge_overlay(frame, mask, edges))
+
+            # Periodic clear cache
+            if self.use_gpu and i > 0 and i % self.proc_cfg.get("cuda_clear_interval", 50) == 0:
+                torch.cuda.empty_cache()
+
+            if (i+1) % 100 == 0:
+                log.info(f"    Frame {i+1}/{num_frames}")
+
+        return outs
+
+    def run(self, episodes: list[int] | None = None, dry_run: bool = False):
+        """Run the full augmentation pipeline."""
+        src_id = self.dataset_cfg["source_repo_id"]
+        src_path = self.dataset_cfg["source_path"]
+        
+        log.info(f"Loading source: {src_id}")
+        src = LeRobotDataset(repo_id=src_id, root=src_path, video_backend="pyav")
+        
+        # Determine features
+        # We need depth_suffix determined before building features, so init models first if not dry run
+        # Or just determine suffix from config without loading.
+        # We did suffix setup in _init_models, let's peek config here or just init models.
+        if self.modalities_cfg.get("depth", False):
+             self.depth_suffix = "depth_da_v2" if self.cfg["depth"]["type"] == "da_v2" else "depth_zoedepth"
+        else:
+            self.depth_suffix = ""
+
+        aug_features = self._build_features(src.meta.features)
+        
+        log.info(f"Features: {list(aug_features.keys())}")
+        if dry_run:
+            log.info("Dry run logic complete. Exiting.")
+            return
+
+        # Init models
+        self._init_models()
+
+        # Clean output
+        if self.output_path.exists():
+            import shutil
+            log.warning(f"Removing existing output: {self.output_path}")
+            shutil.rmtree(self.output_path)
+
+        # Create destination
+        log.info(f"Creating dataset at {self.output_path}")
+        dst = LeRobotDataset.create(
+            repo_id=self.output_repo_id,
+            fps=src.fps,
+            features=aug_features,
+            root=str(self.output_path),
+            robot_type=src.meta.robot_type,
+            image_writer_threads=self.proc_cfg.get("image_writer_threads", 4),
         )
 
-        # Get task string for this episode
-        task_str = get_episode_task(src, ep_idx)
-        log.info("  Task: %s", task_str)
+        ep_list = episodes if episodes is not None else range(src.meta.total_episodes)
+        total = len(ep_list)
+        
+        log.info(f"Processing {total} episodes...")
+        
+        pipeline_start = time.time()
+        
+        for i, ep_idx in enumerate(ep_list):
+            ep_start = time.time()
+            task, from_idx, to_idx = self.get_episode_info(src, ep_idx)
+            
+            log.info(f"=== Episode {i+1}/{total} (idx={ep_idx}) Task: {task} ===")
+            
+            # Read source frames
+            cam_frames = {}
+            for cam in self.cameras:
+                log.info(f"  Reading {cam}...")
+                cam_frames[cam] = self.read_frames_pyav(src, ep_idx, cam)
+            
+            # Process
+            cam_processed = {}
+            for cam in self.cameras:
+                log.info(f"  Processing {cam}...")
+                cam_processed[cam] = self.process_camera_frames(cam_frames[cam], cam)
+            
+            # Write frames
+            ep_len_actual = len(cam_frames[self.cameras[0]])
+            log.info(f"  Writing {ep_len_actual} frames...")
+            
+            for f_i in range(ep_len_actual):
+                frame_data = {"task": task}
+                
+                # Copy scalar features
+                src_item = src.hf_dataset[from_idx + f_i]
+                for k, v in src.meta.features.items():
+                    if k not in aug_features: continue # Skip if not in new features (e.g. old info)
+                    if v["dtype"] in ("video", "image"): continue
+                    val = src_item[k]
+                    if hasattr(val, "numpy"): val = val.numpy()
+                    frame_data[k] = val
+                
+                # Add video frames (original + augmented)
+                for cam in self.cameras:
+                    frame_data[cam] = cam_frames[cam][f_i]
+                    
+                    # Add modalities
+                    mods = cam_processed[cam]
+                    # Map back to features dict keys
+                    if self.modalities_cfg.get("seg", False):
+                        frame_data[f"{cam}_seg"] = mods["seg"][f_i]
+                    if self.modalities_cfg.get("edges", False):
+                        frame_data[f"{cam}_edges"] = mods["edges"][f_i]
+                    if self.modalities_cfg.get("depth", False):
+                        frame_data[f"{cam}_{self.depth_suffix}"] = mods[self.depth_suffix][f_i]
+                    if self.modalities_cfg.get("overlays", False):
+                        frame_data[f"{cam}_mask_edge_overlay"] = mods["mask_edge_overlay"][f_i]
+                        frame_data[f"{cam}_original_mask_edge_overlay"] = mods["original_mask_edge_overlay"][f_i]
+                        
+                dst.add_frame(frame_data)
+            
+            dst.save_episode()
+            log.info(f"  Episode done in {time.time()-ep_start:.1f}s")
+            
+        dst.finalize()
+        log.info(f"Pipeline complete. Saved to: {self.output_path}")
 
-        # Get source data indices for this episode
-        from_idx, to_idx = get_episode_data_slice(src, ep_idx)
 
-        # Read original video frames per camera
-        all_camera_frames = {}
-        for camera in cameras:
-            log.info("  Reading %s frames...", camera)
-            all_camera_frames[camera] = read_episode_frames(
-                src, ep_idx, camera, tolerance_s
-            )
-            log.info(
-                "    Read %d frames, shape=%s",
-                len(all_camera_frames[camera]),
-                all_camera_frames[camera].shape,
-            )
-
-        # Process frames per camera to generate new modalities
-        all_camera_modalities = {}
-        for camera in cameras:
-            log.info("  Processing %s modalities...", camera)
-            all_camera_modalities[camera] = process_frames(
-                frames_rgb=all_camera_frames[camera],
-                segmenter=segmenters[camera],
-                canny=canny,
-                depth_model=depth_model,
-                depth_suffix=depth_suffix,
-                device=device,
-                cuda_clear_interval=cuda_clear_interval,
-            )
-
-        # Add each frame to the destination dataset
-        log.info("  Adding %d frames to dataset...", episode_length)
-        for frame_idx in range(episode_length):
-            # Build frame dict with all features
-            frame = {"task": task_str}
-
-            # Non-video features from source parquet data
-            src_item = src.hf_dataset[from_idx + frame_idx]
-            for key, ft in src.meta.features.items():
-                if ft["dtype"] in ("video", "image"):
-                    continue
-                if key in ("timestamp", "frame_index", "episode_index", "index", "task_index"):
-                    continue
-                val = src_item[key]
-                if hasattr(val, "numpy"):
-                    val = val.numpy()
-                frame[key] = val
-
-            # Original video frames (as numpy RGB uint8)
-            for camera in cameras:
-                frame[camera] = all_camera_frames[camera][frame_idx]
-
-            # New modality frames
-            for camera in cameras:
-                mods = all_camera_modalities[camera]
-                frame[f"{camera}_seg"] = mods["seg"][frame_idx]
-                frame[f"{camera}_edges"] = mods["edges"][frame_idx]
-                frame[f"{camera}_{depth_suffix}"] = mods[depth_suffix][frame_idx]
-                frame[f"{camera}_mask_edge_overlay"] = mods["mask_edge_overlay"][frame_idx]
-                frame[f"{camera}_original_mask_edge_overlay"] = mods["original_mask_edge_overlay"][frame_idx]
-
-            dst.add_frame(frame)
-
-        # Save episode (writes parquet, encodes videos, updates metadata)
-        log.info("  Saving episode (encoding %d video streams)...", len(dst.meta.video_keys))
-        dst.save_episode()
-
-        ep_elapsed = time.time() - ep_start
-        total_frames_processed += episode_length
-        log.info(
-            "  Episode %d done in %.1fs (%.1f frames/sec)",
-            ep_idx, ep_elapsed, episode_length / ep_elapsed,
-        )
-
-        # Clear GPU memory between episodes
-        if device == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-    # ---------------------------------------------------------------
-    # Step 7: Finalize
-    # ---------------------------------------------------------------
-    log.info("Finalizing dataset...")
-    dst.finalize()
-
-    total_elapsed = time.time() - pipeline_start
-    log.info(
-        "=== PIPELINE COMPLETE ===\n"
-        "  Episodes: %d\n"
-        "  Total frames: %d\n"
-        "  Time: %.1f seconds (%.1f min)\n"
-        "  Output: %s",
-        total_episodes,
-        total_frames_processed,
-        total_elapsed,
-        total_elapsed / 60,
-        dst.root,
-    )
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Augment LeRobot dataset with visual modalities")
-    parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
-    parser.add_argument(
-        "--episodes",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Optional: specific episode indices to process (for testing)",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--episodes", type=int, nargs="+", default=None)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
-    run_pipeline(cfg, args.episodes)
+    pipeline = AugmentationPipeline(args.config)
+    pipeline.run(episodes=args.episodes, dry_run=args.dry_run)
+
 
 if __name__ == "__main__":
     main()

@@ -4,22 +4,22 @@
 dataset:
   source_repo_id: "pranavnaik98/bimanual_so101_stacking_100"
   source_path: "/home/kinisi/Documents/main/lerobot-bimanual/custom_scripts/analysis/data/pranavnaik98/bimanual_so101_stacking_100"
-  output_repo_id: "pranavnaik98/bimanual_so101_stacking_100_augmented"
-  output_path: "/home/kinisi/Documents/main/lerobot-bimanual/custom_scripts/analysis/data/pranavnaik98/bimanual_so101_stacking_100_augmented"
+  # Directory where the augmented dataset will be created (will add /{output_name} automatically)
+  root_dir: "/home/kinisi/Documents/main/lerobot-bimanual/custom_scripts/analysis/data"
+  # Base name for constructing the dynamic output repo ID/folder
+  original_name: "bimanual_so101_stacking_100"
 
 # Camera observations to augment
 cameras:
   - observation.images.top
   - observation.images.front
 
-# Modalities to generate (5 per camera = 10 total)
+# Modalities to generate
 modalities:
   seg: true
   edges: true
-  depth_da_v2: true           # EXCLUSIVE with zoedepth
-  depth_zoedepth: false       # EXCLUSIVE with da_v2
-  mask_edge_overlay: true
-  original_mask_edge_overlay: true
+  depth: true
+  overlays: true  # mask_edge_overlay + original_mask_edge_overlay
 
 # YOLO segmentation (per camera)
 segmentation:
@@ -38,8 +38,10 @@ segmentation:
     retina_masks: false
     max_det: 8
 
-# Depth models (exclusive - only one at a time)
+# Depth estimation
 depth:
+  enabled: true
+  type: "da_v2"  # "da_v2" or "zoedepth"
   da_v2:
     model_id: "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
     colormap: "INFERNO"
@@ -47,11 +49,16 @@ depth:
     model_id: "Intel/zoedepth-nyu"
     colormap: "MAGMA"
 
-# Canny edge detection
+# Canny edge detection (per camera)
 canny:
-  threshold1: 100
-  threshold2: 200
-  aperture_size: 3
+  top_camera:
+    threshold1: 100
+    threshold2: 200
+    aperture_size: 3
+  front_camera:
+    threshold1: 100
+    threshold2: 200
+    aperture_size: 3
 
 # Processing parameters
 processing:
