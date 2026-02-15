@@ -16,10 +16,10 @@ cameras:
 
 # Modalities to generate
 modalities:
-  seg: true
+  seg: false
   edges: true
-  depth: true
-  overlays: true  # mask_edge_overlay + original_mask_edge_overlay
+  depth: false
+  overlays: false  # mask_edge_overlay + original_mask_edge_overlay
 
 # YOLO segmentation (per camera)
 segmentation:
@@ -27,14 +27,14 @@ segmentation:
     model_path: "/home/kinisi/Documents/side/AutoAnnotatorPy/model_training/annotations/top_camera/output/seg_20251231_124816/weights/best.pt"
     conf: 0.25
     iou: 0.45
-    imgsz: 512
+    imgsz: 640
     retina_masks: false
     max_det: 8
   front_camera:
     model_path: "/home/kinisi/Documents/side/AutoAnnotatorPy/model_training/annotations/real/output/seg_20251231_135408/weights/best.pt"
     conf: 0.25
     iou: 0.45
-    imgsz: 512
+    imgsz: 640
     retina_masks: false
     max_det: 8
 
@@ -55,10 +55,14 @@ canny:
     threshold1: 100
     threshold2: 200
     aperture_size: 3
+    sigma: 1.0
+    kernel_size: [7, 7]
   front_camera:
-    threshold1: 100
+    threshold1: 50
     threshold2: 200
     aperture_size: 3
+    sigma: 1.0
+    kernel_size: [3, 3]
 
 # Processing parameters
 processing:

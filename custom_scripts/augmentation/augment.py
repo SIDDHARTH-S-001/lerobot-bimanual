@@ -206,7 +206,9 @@ class AugmentationPipeline:
                 self.canny_detectors[cam] = CannyDetector(
                     threshold1=canny_cfg["threshold1"],
                     threshold2=canny_cfg["threshold2"],
-                    aperture_size=canny_cfg["aperture_size"]
+                    aperture_size=canny_cfg["aperture_size"],
+                    sigma=canny_cfg.get("sigma", 1.0),
+                    kernel_size=canny_cfg.get("kernel_size", [3, 3]),
                 )
                 log.info(f"  Canny initialized for {cam}: {canny_cfg}")
         
