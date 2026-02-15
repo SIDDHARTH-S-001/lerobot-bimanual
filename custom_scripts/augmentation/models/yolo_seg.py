@@ -48,8 +48,11 @@ class YOLOSegmenter:
         Returns:
             Mask (H, W, 3), uint8. Black background, colored objects.
         """
+        # Convert RGB to BGR as YOLO/OpenCV expects BGR
+        bgr_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+
         results = self.model.predict(
-            rgb_frame,
+            bgr_frame,
             imgsz=self.imgsz,
             conf=self.conf,
             iou=self.iou,
